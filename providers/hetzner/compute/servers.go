@@ -56,6 +56,27 @@ func Servers(ctx context.Context, client providers.ProviderClient) ([]models.Res
 		return nil, err
 	}
 
+	// /servers embeds server_type WITHOUT pricings, so join with
+	// /server-types (docs.hetzner.cloud/reference/cloud#tag/server-types)
+	// which carries per-location monthly Gross.
+	priceByTypeID := make(map[int64]map[string]float64)
+	if types, err := client.HetznerClient.ServerType.All(ctx); err == nil {
+		for _, t := range types {
+			m := make(map[string]float64)
+			for _, p := range t.Pricings {
+				if p.Location != nil {
+					m[p.Location.Name] = monthlyPriceGross(p.Monthly.Gross, 0)
+				}
+			}
+			if len(t.Pricings) > 0 && len(m) == 0 {
+				m[""] = monthlyPriceGross(t.Pricings[0].Monthly.Gross, 0)
+			}
+			priceByTypeID[t.ID] = m
+		}
+	} else {
+		log.WithError(err).Warn("Hetzner server-types pricing lookup failed, costs may be 0")
+	}
+
 	for _, s := range servers {
 		tags := make([]models.Tag, 0, len(s.Labels))
 		for k, v := range s.Labels {
@@ -69,10 +90,20 @@ func Servers(ctx context.Context, client providers.ProviderClient) ([]models.Res
 
 		monthlyGross := 0.0
 		if s.ServerType != nil {
-			for _, p := range s.ServerType.Pricings {
-				if p.Location != nil && p.Location.Name == region {
-					monthlyGross = monthlyPriceGross(p.Monthly.Gross, 0)
-					break
+			// Prefer joined /server-types pricings; fall back to embedded (usually empty).
+			if m, ok := priceByTypeID[s.ServerType.ID]; ok {
+				if v, ok := m[region]; ok {
+					monthlyGross = v
+				} else if v, ok := m[""]; ok {
+					monthlyGross = v
+				}
+			}
+			if monthlyGross == 0 {
+				for _, p := range s.ServerType.Pricings {
+					if p.Location != nil && p.Location.Name == region {
+						monthlyGross = monthlyPriceGross(p.Monthly.Gross, 0)
+						break
+					}
 				}
 			}
 			if monthlyGross == 0 && len(s.ServerType.Pricings) > 0 {

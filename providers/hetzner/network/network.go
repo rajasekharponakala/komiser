@@ -42,6 +42,29 @@ func LoadBalancers(ctx context.Context, client providers.ProviderClient) ([]mode
 		return nil, err
 	}
 
+	// Join with /load-balancer-types for per-location monthly Gross.
+	priceByLBTypeID := make(map[int64]map[string]float64)
+	if types, err := client.HetznerClient.LoadBalancerType.All(ctx); err == nil {
+		for _, t := range types {
+			m := make(map[string]float64)
+			for _, p := range t.Pricings {
+				if p.Location != nil {
+					if v, err := strconv.ParseFloat(p.Monthly.Gross, 64); err == nil {
+						m[p.Location.Name] = v
+					}
+				}
+			}
+			if len(t.Pricings) > 0 && len(m) == 0 {
+				if v, err := strconv.ParseFloat(t.Pricings[0].Monthly.Gross, 64); err == nil {
+					m[""] = v
+				}
+			}
+			priceByLBTypeID[t.ID] = m
+		}
+	} else {
+		log.WithError(err).Warn("Hetzner load-balancer-types pricing lookup failed, costs may be 0")
+	}
+
 	for _, lb := range lbs {
 		tags := make([]models.Tag, 0, len(lb.Labels))
 		for k, v := range lb.Labels {
@@ -55,12 +78,21 @@ func LoadBalancers(ctx context.Context, client providers.ProviderClient) ([]mode
 
 		monthlyGross := 0.0
 		if lb.LoadBalancerType != nil {
-			for _, p := range lb.LoadBalancerType.Pricings {
-				if p.Location != nil && p.Location.Name == region {
-					if v, err := strconv.ParseFloat(p.Monthly.Gross, 64); err == nil {
-						monthlyGross = v
+			if m, ok := priceByLBTypeID[lb.LoadBalancerType.ID]; ok {
+				if v, ok := m[region]; ok {
+					monthlyGross = v
+				} else if v, ok := m[""]; ok {
+					monthlyGross = v
+				}
+			}
+			if monthlyGross == 0 {
+				for _, p := range lb.LoadBalancerType.Pricings {
+					if p.Location != nil && p.Location.Name == region {
+						if v, err := strconv.ParseFloat(p.Monthly.Gross, 64); err == nil {
+							monthlyGross = v
+						}
+						break
 					}
-					break
 				}
 			}
 			if monthlyGross == 0 && len(lb.LoadBalancerType.Pricings) > 0 {
